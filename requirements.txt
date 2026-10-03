@@ -1,0 +1,7 @@
+streamlit>=1.37
+requests-cache>=1.2
+beautifulsoup4
+lxml
+pandas
+openpyxl
+playwright
