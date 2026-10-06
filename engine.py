@@ -4,10 +4,10 @@ from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 import requests_cache, pandas as pd
 from bs4 import BeautifulSoup
-from sources import OLX, MODELS, REGIONS
+from sources import OLX, MODELS, REGIONS, YEAR_RULES
 
 D = Path("data"); D.mkdir(exist_ok=True)
-SPEED = {"Hati-hati": (4, 8), "Seimbang": (2.5, 5), "Cepat": (1.5, 3)}
+SPEED = {"Hati-hati": ((4, 8), 40, 120), "Seimbang": ((2.5, 5), 60, 90), "Cepat": ((1.5, 3), 100, 45)}   # (jeda detik, ukuran batch, istirahat batch)
 QUERIES = [k for k in MODELS if not any(k != j and k.lower().startswith(j.lower() + " ") for j in MODELS)]
 DEFAULT = dict(target=10000, speed="Seimbang", queries=[q.lower() for q in QUERIES], max_pages=15, timeout=45, retries=2,
                max_fails=4, mode="auto", headed=False, dedup_judul=True, rescue=True, max_detail=150, semua=False, bad_pages=3, max_requests=6000, cache_hours=24, batch_size=60, batch_pause=90,
@@ -28,7 +28,7 @@ class Stop(Exception): pass
 
 def new_state():
     return dict(running=False, stop=False, ok=0, rejected=0, req=0, msg="Belum berjalan", log=[], errs={}, why={},
-                cur="", cur_t=0, snaps=0, pages=[], pages_n=0, pg_ok=0, pg_bad=0, quota={}, dupn=0, outn=0, susn=0, resc=0, cd=0, ct=0, capped=0, t0=0)
+                cur="", cur_t=0, snaps=0, pages=[], pages_n=0, pg_ok=0, pg_bad=0, quota={}, dupn=0, outn=0, susn=0, resc=0, cd=0, ct=0, capped=0, t0=0, t_load=0.0, t_delay=0.0, t_pause=0.0, t_fail=0.0, req_ok=0, mult=1.0, bfreq={})
 
 
 def log(S, m, lv="INFO"):
@@ -37,6 +37,12 @@ def log(S, m, lv="INFO"):
     try:
         with open(D / "scraper.log", "a", encoding="utf-8") as fh: fh.write(time.strftime("%Y-%m-%d ") + line + "\n")
     except OSError: pass
+
+
+def speed(S):
+    el = max(time.time() - (S["t0"] or time.time()), 1); n = max(S["req_ok"], 1)
+    return (f"KECEPATAN {S['req'] / el * 3600:,.0f} req/jam | {S['ok'] / el * 3600:,.0f} data bersih/jam | per halaman: muat {S['t_load'] / n:.1f}s + jeda {S['t_delay'] / n:.1f}s | "
+            f"istirahat batch {S['t_pause'] / 60:.0f} mnt | terbuang karena gagal {S['t_fail'] / 60:.0f} mnt | pengali jeda x{S['mult']:.1f}")
 
 
 def snap(S, url, body, tag):
@@ -102,17 +108,18 @@ class Fetcher:
             if kind is None and st != 200: kind = f"HTTP{st}"
             if kind is None:
                 s.fails = 0; s.streak += 1
-                if s.streak % 15 == 0 and s.mult > 1: s.mult = max(1.0, s.mult * .75); log(s.S, f"jeda dipercepat ×{s.mult:.1f}")
-                lo, hi = c["delay"]; s.wait(random.uniform(lo, hi) * s.mult)
+                if s.streak % 5 == 0 and s.mult > 1: s.mult = max(1.0, s.mult * .6); s.S["mult"] = s.mult; log(s.S, f"jeda dipercepat ×{s.mult:.1f}")
+                lo, hi = c["delay"]; d = random.uniform(lo, hi) * s.mult; s.S["t_load"] += el; s.S["req_ok"] += 1; s.S["t_delay"] += d; s.wait(d)
+                if s.n % 25 == 0: log(s.S, speed(s.S))
                 if s.n % c["batch_size"] == 0:
-                    log(s.S, f"batch selesai ({s.n} request), istirahat {c['batch_pause']}s"); s.wait(c["batch_pause"])
+                    log(s.S, f"batch selesai ({s.n} request), istirahat {c['batch_pause']}s"); s.S["t_pause"] += c["batch_pause"]; s.wait(c["batch_pause"])
                 return body
-            s.fails += 1; s.streak = 0; s.mult = min(s.mult * 2, 8); s.S["errs"][kind] = s.S["errs"].get(kind, 0) + 1
+            s.fails += 1; s.streak = 0; s.mult = min(s.mult * 2, 4); s.S["mult"] = s.mult; s.S["t_fail"] += el; s.S["errs"][kind] = s.S["errs"].get(kind, 0) + 1
             log(s.S, f"GAGAL {kind} {el:.1f}s (percobaan {a + 1}/{c['retries']}, beruntun {s.fails}, jeda ×{s.mult:.0f}) {url} {msg}", "ERROR")
             if body is not None: snap(s.S, url, body, kind)
             if s.fails >= c["max_fails"]: raise Blocked(f"{s.fails} kegagalan beruntun, terakhir {kind}")
             ra = hdr.get("Retry-After", "")
-            s.wait(min(int(ra), 900) if ra.isdigit() else min(10 * 2 ** a, 120))
+            w = min(int(ra), 900) if ra.isdigit() else min(10 * 2 ** a, 120); s.S["t_fail"] += w; s.wait(w)
         return None
 
 
@@ -144,8 +151,14 @@ def diagnose(url):
 
 
 # ---------- Mode browser (Playwright biasa, tanpa stealth) ----------
+TRACKERS = ("google-analytics", "googletagmanager", "doubleclick", "googlesyndication", "facebook.", "hotjar", "clarity.ms", "criteo", "taboola", "outbrain",
+            "appsflyer", "adjust.", "branch.io", "segment.", "amplitude", "sentry.io", "newrelic", "nr-data", "tiktok", "snapchat", "twitter.", "linkedin",
+            "adnxs", "pubmatic", "openx", "rubiconproject", "smartadserver")
+
+
 class BrowserFetcher(Fetcher):
-    """Browser sungguhan; memakai jeda, cache, batas request, dan circuit breaker yang sama dengan Fetcher."""
+    """Browser sungguhan; jeda, cache, batas request, dan circuit breaker sama dengan Fetcher.
+    Gambar, CSS, font, dan pelacak/iklan pihak ketiga diblokir agar halaman cepat termuat (skrip OLX sendiri tetap jalan)."""
     def __init__(s, cfg, S):
         s.cfg, s.S, s.rob, s.n, s.fails, s.streak, s.mult, s.last, s.used = cfg, S, {}, 0, 0, 0, 1.0, {}, 0
         import sys, asyncio
@@ -158,8 +171,12 @@ class BrowserFetcher(Fetcher):
         if head:
             pg = s.br.new_page(); kw["user_agent"] = pg.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome"); pg.close()
         s.ctx = s.br.new_context(**kw)
-        s.ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in ("image", "media", "font") else r.continue_())
-        s.page = s.ctx.new_page()
+
+        def gate(r):
+            q = r.request
+            if q.resource_type in ("image", "media", "font", "stylesheet", "texttrack") or any(t in q.url for t in TRACKERS): return r.abort()
+            return r.continue_()
+        s.ctx.route("**/*", gate); s.page = s.ctx.new_page()
 
     def _robots(s, base):
         s.page.goto(base + "/robots.txt", timeout=20000); return s.page.inner_text("body")
@@ -167,10 +184,16 @@ class BrowserFetcher(Fetcher):
     def _fetch(s, url):
         f = D / "html_cache" / (hashlib.md5(url.encode()).hexdigest() + ".html")
         if f.exists() and time.time() - f.stat().st_mtime < s.cfg["cache_hours"] * 3600: return 200, f.read_text(encoding="utf-8"), True, {}
-        resp = s.page.goto(url, wait_until="domcontentloaded", timeout=s.cfg["timeout"] * 1000)
-        try: s.page.wait_for_selector('a[href*="/item/"]', timeout=3000)
-        except Exception: pass                                                  # bisa jadi hasil kosong
-        body, st = s.page.content(), (resp.status if resp else None)
+        try: resp = s.page.goto(url, wait_until="domcontentloaded", timeout=min(s.cfg["timeout"], 30) * 1000)
+        except Exception as e:
+            if type(e).__name__ != "TimeoutError": raise
+            resp = None                                        # lambat: tetap pakai DOM yang sudah ada bila iklan sudah termuat
+        body = s.page.content()
+        if "/item/" not in body:                               # hasil kosong, atau iklan belum muncul: tunggu sebentar saja
+            try: s.page.wait_for_selector('a[href*="/item/"]', timeout=2000); body = s.page.content()
+            except Exception: pass
+        st = resp.status if resp else (200 if "<title" in body and "/item/" in body else None)
+        if st is None: raise TimeoutError("halaman tidak termuat")
         if st == 200: f.parent.mkdir(exist_ok=True); f.write_text(body, encoding="utf-8")
         s.used += 1
         if s.used % 250 == 0: s.page.close(); s.page = s.ctx.new_page()          # daur ulang tab agar memori tidak membengkak
@@ -211,16 +234,22 @@ def num(t):
     return int(vals[0]) if vals else None   # hanya angka pertama
 
 
-def find_cards(soup):
-    """Elemen berulang (tag+class sama) yang berisi tepat 1 link iklan (/item/) dan harga 'Rp'. Kartu promo kredit (banyak 'Rp') tetap terbaca."""
-    g = {}
+def find_cards(soup, cap=None):
+    """Kartu iklan = elemen dengan tepat 1 link /item/ dan harga 'Rp' (kartu promo kredit dengan banyak 'Rp' tetap terbaca).
+    Halaman biasa: kelompok (tag+class) terbesar, berapa pun jumlahnya (halaman dengan 1-2 iklan juga terbaca).
+    Sisa hasil sedikit (cap <= 5): ambil 'cap' kartu pertama menurut urutan DOM, karena hasil muncul sebelum rekomendasi."""
+    els, g = [], {}
     for el in soup.find_all(["li", "div", "article", "a"]):
         links = {a["href"].split("?")[0] for a in ([el] if el.name == "a" else []) + el.find_all("a", href=True) if "/item/" in (a.get("href") or "")}
         t = el.get_text(" ", strip=True)
         if len(links) == 1 and len(t) < 700 and re.search(r"rp\.?\s?\d", t, re.I):
-            g.setdefault((el.name, tuple(el.get("class") or [])), []).append(el)
-    best = max(g.values(), key=len, default=[])
-    return best if len(best) >= 3 else []
+            els.append((next(iter(links)), el)); g.setdefault((el.name, tuple(el.get("class") or [])), []).append(el)
+    if cap is not None and cap <= 5:
+        out, seen = [], set()
+        for href, el in els:
+            if href not in seen: seen.add(href); out.append(el)
+        return out[:cap]
+    return max(g.values(), key=len, default=[])
 
 
 def auto_fields(c):
@@ -241,7 +270,29 @@ def parse(html):
     return [auto_fields(c) for c in find_cards(soup)], (soup.title.get_text(strip=True) if soup.title else "")
 
 
+def total_of(text):
+    """Jumlah iklan hasil pencarian yang tertulis di halaman, mis. 'Menampilkan hasil untuk "mio"753 Iklan'."""
+    m = re.search(r'Menampilkan hasil untuk\s*"[^"]*"\s*([\d.]+)\s*iklan', text, re.I) or re.search(r"([\d.]+)\s+iklan masuk", text, re.I)
+    return int(m[1].replace(".", "")) if m else None
+
+
+def buckets_of(soup):
+    """Peta jumlah iklan per rentang km dari filter di halaman (bila terbaca): {N: jumlah} untuk filter mileage_eq_N."""
+    out = {}
+    for a in soup.select('a[href*="mileage_eq_"]'):
+        m, c = re.search(r"mileage_eq_(\d+)", a["href"]), re.search(r"\((\d[\d.]*)\)", a.get_text(" ", strip=True))
+        if m and c: out[int(m[1])] = int(c[1].replace(".", ""))
+    return out
+
+
+def parse4(html, remaining=None):
+    soup = BeautifulSoup(html, "lxml"); total = total_of(soup.get_text(" ", strip=True))
+    cap = remaining if remaining is not None else total
+    return [auto_fields(c) for c in find_cards(soup, cap)], (soup.title.get_text(strip=True) if soup.title else ""), total, buckets_of(soup)
+
+
 # ---------- Cleaning ----------
+
 KN = {k: re.sub(r"[^a-z0-9]", "", k.lower()) for k in MODELS}
 QMAP = {v: k for k, v in KN.items()}
 PROMO = re.compile(r"\b(?:dp|kredit|credit|cicil|cicilan|angsuran|tdp|kredivo)\b", re.I)
@@ -264,12 +315,18 @@ def fuzzy(t, qkey):
     return best
 
 
+BW = {b.lower().split("-")[0]: b for b in {v[0] for v in MODELS.values()}}      # kata merek -> nama merek
+
+
 def find_model(raw, qkey):
-    t = raw["title"].lower()
+    """Cocokkan model (pola persis -> alias -> salah ketik). Bila judul menyebut merek lain, model dengan merek berbeda diabaikan."""
+    t = raw["title"].lower(); ment = lambda s: {b for w, b in BW.items() if re.search(rf"\b{re.escape(w)}\b", s)}
     for src in (t, raw["text"].lower()):
-        k = next((k for rx, k in MP if rx.search(src)), None) or alias(src)
+        m = ment(src)
+        k = next((k for rx, k in MP if rx.search(src) and (not m or MODELS[k][0] in m)), None) or alias(src)
         if k: return k
-    return fuzzy(t, qkey)
+    k, m = fuzzy(t, qkey), ment(t)
+    return k if k and (not m or MODELS[k][0] in m) else None
 
 
 def pick_region(parts):
@@ -288,6 +345,7 @@ def clean(raw, prov, cfg, qkey=None):
     city, rprov, lraw = pick_region(raw["parts"])
     ym = YR.search(raw["text"]); year = int(raw["year"]) if raw["year"] else (int(ym[1]) if ym else None)
     km, price, why = raw.get("km"), num(raw["price"]), []
+    if key in YEAR_RULES and year: op, yr, c2 = YEAR_RULES[key]; cc = c2 if (year <= yr if op == "<=" else year >= yr) else cc
     if not key: why.append("model tidak dikenali")
     if not city: why.append("lokasi tidak dikenali")
     elif rprov != prov: why.append("lokasi di luar wilayah query")
@@ -396,41 +454,65 @@ def preflight(cfg, f, S):
 
 
 def crawl(cfg, f, S, con, now, mem, balanced):
-    """balanced=True: kuota sama per provinsi. balanced=False: tanpa kuota (mengisi sisa target). Target dihitung dari data BERSIH."""
-    quota, bad = -(-cfg["target"] // len(OLX["locations"])), 0
-    combos = [(q.strip(), v) for q in cfg["queries"] for v in OLX["variants"]]; random.Random(7).shuffle(combos)  # sampel merata
-    S["ct"], limit = len(combos) * len(OLX["locations"]), (100 if cfg["semua"] else cfg["max_pages"])
-    for q, var in combos:
+    """Per (model x provinsi): 1 halaman 'peta' (total iklan & sebaran km), lalu hanya bucket km yang berisi.
+    Tiap halaman berhenti memakai total iklan yang tertulis di halaman, jadi tanpa permintaan 'akhir hasil' tambahan."""
+    quota, bad = -(-cfg["target"] // len(OLX["locations"])), [0]
+    limit = 100 if cfg["semua"] else cfg["max_pages"]
+    jobs = [(q.strip(), prov, slug) for q in cfg["queries"] for prov, slug in OLX["locations"].items()]
+    random.Random(7).shuffle(jobs); S["ct"] = len(jobs)
+
+    def page(url, tag, prev, expect, got):
+        html = f.get(url); raws, title, total, bk = parse4(html, None if expect is None else max(0, expect - got)) if html else ([], "", None, {})
+        tot = expect if expect is not None else total
+        if tot is not None: raws = raws[:max(0, tot - got)]               # tidak pernah melebihi total (iklan rekomendasi tidak ikut)
+        urls = {r["id"] for r in raws}
+        v = ("HABIS" if f.last.get("status") == 404 else "GAGAL") if html is None else \
+            "ULANG" if raws and urls == prev else "OK" if raws else "KOSONG" if OLX["title_marker"] in title.lower() else "ANOMALI"
+        page_log(S, f, v, len(raws), len([r for r in raws if r["id"] not in mem["seen"]]), tag)
+        bad[0] = bad[0] + 1 if v in ("GAGAL", "ANOMALI") else 0
+        if v == "ANOMALI": snap(S, url, html, "anomali")
+        if bad[0] >= cfg["bad_pages"]: raise Blocked(f"{bad[0]} halaman bermasalah beruntun (terakhir {v})")
+        return v, raws, urls, tot, bk
+
+    def walk(q, prov, slug, qkey, var, expect):
+        ids, prev, strikes, tot = set(), None, 0, expect
+        for pg in range(1, limit + 1):
+            tag = f"{prov} · {q} · km~{var['km'] // 1000}rb · h{pg}"; S["msg"] = tag
+            v, raws, urls, tot, _ = page(url_of(slug, q, var, pg), tag, prev, tot, len(ids))
+            if v != "OK": break
+            prev = urls; ids |= urls; kept = 0; new = [r for r in raws if r["id"] not in mem["seen"]]
+            for raw in new:
+                mem["seen"].add(raw["id"]); raw["km"] = var["km"]
+                row, why = clean(raw, prov, cfg, qkey)
+                if why:
+                    con.execute("INSERT OR REPLACE INTO rejected VALUES (?,?,?,?,?)", (raw["id"], raw["url"], "; ".join(why), row["lokasi_mentah"], now))
+                    S["rejected"] += 1
+                    for w in why: S["why"][w] = S["why"].get(w, 0) + 1
+                else: save(con, row, now); kept += 1
+            con.commit()
+            if kept: S["bfreq"][var["km"]] = S["bfreq"].get(var["km"], 0) + kept; refresh(S, cfg)
+            strikes = strikes + 1 if (len(new) >= 8 and kept == 0) else 0       # halaman penuh iklan baru tapi tak ada yang relevan
+            if strikes >= 2: log(S, f"hasil tidak relevan di {tag}; kombinasi dihentikan", "WARN"); break
+            if not cfg["semua"] and S["ok"] >= cfg["target"]: S["msg"] = "Target tercapai"; raise Stop
+            if tot is not None and len(ids) >= tot: break
+        else:
+            S["capped"] += 1; log(S, f"Kedalaman maksimum ({limit} halaman) tercapai: {tag}; sebagian iklan kombinasi ini mungkin tidak terambil", "WARN")
+        return tot if tot is not None else len(ids)
+
+    for q, prov, slug in jobs:
+        ck = (q, prov)
+        if ck in mem["done"] or (balanced and S["quota"].get(prov, 0) >= quota): continue
         qkey = QMAP.get(re.sub(r"[^a-z0-9]", "", q.lower()))
-        for prov, slug in OLX["locations"].items():
-            ck = (q, var["qs"], prov)
-            if ck in mem["done"] or (balanced and S["quota"].get(prov, 0) >= quota): continue
-            prev = None
-            for page in range(1, limit + 1):
-                url = url_of(slug, q, var, page); tag = f"{prov} · {q} · km~{var['km'] // 1000}rb · h{page}"; S["msg"] = tag
-                html = f.get(url); raws, title = parse(html) if html else ([], ""); urls = {r["id"] for r in raws}
-                new = [r for r in raws if r["id"] not in mem["seen"]]
-                v = ("HABIS" if f.last.get("status") == 404 else "GAGAL") if html is None else \
-                    "ULANG" if raws and urls == prev else "OK" if raws else "KOSONG" if OLX["title_marker"] in title.lower() else "ANOMALI"
-                page_log(S, f, v, len(raws), len(new), tag)
-                bad = bad + 1 if v in ("GAGAL", "ANOMALI") else 0
-                if v == "ANOMALI": snap(S, url, html, "anomali")
-                if bad >= cfg["bad_pages"]: raise Blocked(f"{bad} halaman bermasalah beruntun (terakhir {v})")
-                if v != "OK": break
-                prev = urls
-                for raw in new:
-                    mem["seen"].add(raw["id"]); raw["km"] = var["km"]
-                    row, why = clean(raw, prov, cfg, qkey)
-                    if why:
-                        con.execute("INSERT OR REPLACE INTO rejected VALUES (?,?,?,?,?)", (raw["id"], raw["url"], "; ".join(why), row["lokasi_mentah"], now))
-                        S["rejected"] += 1
-                        for w in why: S["why"][w] = S["why"].get(w, 0) + 1
-                    else: save(con, row, now)
-                con.commit(); refresh(S, cfg)
-                if not cfg["semua"] and S["ok"] >= cfg["target"]: S["msg"] = "Target tercapai"; raise Stop
-            else:      # loop halaman tidak berhenti sendiri = mentok batas kedalaman
-                S["capped"] += 1; log(S, f"Kedalaman maksimum ({limit} halaman) tercapai: {tag}; sebagian iklan kombinasi ini mungkin tidak terambil", "WARN")
-            mem["done"].add(ck); S["cd"] = len(mem["done"])
+        v, _, _, n0, bk = page(url_of(slug, q, {"qs": ""}, 1), f"{prov} · {q} · peta", None, None, 0)
+        if v in ("GAGAL", "ANOMALI"): continue                                   # dicoba lagi di putaran berikutnya
+        if v in ("KOSONG", "HABIS") or n0 == 0: mem["done"].add(ck); S["cd"] = len(mem["done"]); continue   # model tidak ada di provinsi ini
+        got = 0
+        for var in sorted(OLX["variants"], key=lambda x: -S["bfreq"].get(x["km"], 0)):    # rentang km yang paling sering berisi dulu
+            bn = int(re.search(r"eq_(\d+)", var["qs"])[1])
+            if bk and not bk.get(bn): continue                                   # peta terbaca: lewati rentang kosong
+            if not bk and n0 is not None and got >= 0.97 * n0: break             # tanpa peta: berhenti bila semua iklan sudah terhitung
+            got += walk(q, prov, slug, qkey, var, bk.get(bn) if bk else None)
+        mem["done"].add(ck); S["cd"] = len(mem["done"])
 
 
 def cash_price(html):
@@ -457,7 +539,7 @@ def rescue(cfg, f, S, con):
 
 
 def run(cfg, S):
-    cfg = {**DEFAULT, **cfg}; cfg["delay"] = SPEED[cfg["speed"]]
+    cfg = {**DEFAULT, **cfg}; cfg["delay"], cfg["batch_size"], cfg["batch_pause"] = SPEED[cfg["speed"]]
     S.update(new_state(), running=True, msg="Menyiapkan..."); S["log"] = []; S["t0"] = time.time()
     now = dt.datetime.now().isoformat(timespec="seconds"); con, done, f, mem = db(), False, None, dict(seen=set(), done=set())
     try:
@@ -480,6 +562,7 @@ def run(cfg, S):
         con.commit(); con.close()
         try: refresh(S, cfg)
         except Exception: pass
+        log(S, speed(S))
         log(S, f"RINGKASAN bersih={S['ok']} duplikat={S['dupn']} outlier={S['outn']} promo_dicurigai={S['susn']} dirawat_cash={S['resc']} ditolak={S['rejected']} request={S['req']} error={S['errs']} alasan_tolak={dict(sorted(S['why'].items(), key=lambda x: -x[1])[:5])}")
         try: n, d, o, s_ = export(cfg); log(S, f"Ekspor: {n} baris bersih; dipisah ke review: {d} duplikat, {o} outlier, {s_} promo kredit -> data/export/terbaru")
         except Exception as e: log(S, f"Ekspor gagal: {e}", "ERROR")

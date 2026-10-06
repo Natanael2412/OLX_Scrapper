@@ -58,7 +58,7 @@ with t1:
         q = -(-cfg["target"] // len(OLX["locations"]))
         if cfg["semua"]:
             eta = f" · sisa ±{(time.time() - S['t0']) / S['cd'] * (S['ct'] - S['cd']) / 3600:.1f} jam (kasar)" if S["cd"] >= 20 and S["running"] else ""
-            st.progress(min(S["cd"] / max(S["ct"], 1), 1.0), text=f"{S['ok']:,} data bersih · {S['cd']:,}/{S['ct']:,} kombinasi pencarian{eta}")
+            st.progress(min(S["cd"] / max(S["ct"], 1), 1.0), text=f"{S['ok']:,} data bersih · {S['cd']:,}/{S['ct']:,} pencarian (model × provinsi){eta}")
         else: st.progress(min(S["ok"] / cfg["target"], 1.0), text=f"{S['ok']:,} / {cfg['target']:,} data bersih")
         for c, p in zip(st.columns(len(OLX["locations"])), OLX["locations"]):
             if cfg["semua"]: c.caption(f"{p}: {S['quota'].get(p, 0):,} bersih")
@@ -66,6 +66,7 @@ with t1:
         m = st.columns(4)
         m[0].metric("Bersih", f"{S['ok']:,}"); m[1].metric("Duplikat", S["dupn"]); m[2].metric("Outlier", S["outn"]); m[3].metric("Ditolak", S["rejected"])
         st.caption(f"Halaman: {S['pg_ok']} OK · {S['pg_bad']} bermasalah · {S['req']} request · {S['susn']} promo kredit dicurigai" + (f" · {S['capped']} kombinasi mentok kedalaman" if S["capped"] else ""))
+        if S["req"]: st.caption(engine.speed(S))
         st.caption(("🟢 " if S["running"] else "⚪ ") + S["msg"])
         if S["cur"]: st.caption(f"⏳ menunggu respons {time.time() - S['cur_t']:.0f}s")
         if S["errs"]: st.error("Error: " + ", ".join(f"{k}×{v}" for k, v in S["errs"].items()))

@@ -1,6 +1,6 @@
 {
   "target": 15000,
-  "speed": "Seimbang",
+  "speed": "Cepat",
   "queries": [
     "beat",
     "scoopy",
@@ -67,6 +67,7 @@
   "dedup_judul": true,
   "rescue": true,
   "max_detail": 150,
+  "semua": true,
   "bad_pages": 3,
   "max_requests": 6000,
   "cache_hours": 24,
